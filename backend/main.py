@@ -1,12 +1,15 @@
+from dotenv import load_dotenv
+import os
+from pathlib import Path
+
+# Load environment variables from .env file
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / '.env')
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import router
-from dotenv import load_dotenv
 import uvicorn
-import os
-
-# Load environment variables
-load_dotenv()
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application"""
