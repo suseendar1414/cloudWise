@@ -46,7 +46,6 @@ class LLMService:
             response = self._get_completion(messages, temperature=0.7)
 
             # Parse the response into structured format
-            # This is a simplified parsing, you might want to make it more robust
             lines = response.split('\n')
             result = {
                 'platforms': [],
@@ -58,24 +57,45 @@ class LLMService:
             current_section = ''
             for line in lines:
                 line = line.strip()
-                if 'platform' in line.lower():
+                if not line:
+                    continue
+
+                # Check for section headers
+                lower_line = line.lower()
+                if lower_line.startswith('platforms:'):
                     current_section = 'platforms'
-                elif 'resource' in line.lower():
+                    continue
+                elif lower_line.startswith('resources:'):
                     current_section = 'resources'
-                elif 'action' in line.lower():
+                    continue
+                elif lower_line.startswith('action:'):
                     current_section = 'action'
-                elif 'parameter' in line.lower():
+                    continue
+                elif lower_line.startswith('parameters:'):
                     current_section = 'parameters'
-                elif line and current_section:
-                    if current_section in ['platforms', 'resources']:
-                        result[current_section].extend([x.strip() for x in line.split(',')])
+                    continue
+
+                # Process content based on current section
+                if line.startswith('-'):
+                    line = line[1:].strip()
+                    if current_section == 'platforms':
+                        if line:
+                            result['platforms'].append(line)
+                    elif current_section == 'resources':
+                        if line:
+                            result['resources'].append(line.lower())
                     elif current_section == 'action':
-                        result['action'] = line
+                        if line:
+                            result['action'] = line
                     elif current_section == 'parameters':
-                        # Try to parse key-value pairs
                         if ':' in line:
-                            key, value = line.split(':', 1)
-                            result['parameters'][key.strip()] = value.strip()
+                            key, value = [x.strip() for x in line.split(':', 1)]
+                            # Handle list values in square brackets
+                            if value.startswith('[') and value.endswith(']'):
+                                values = [x.strip().strip('"') for x in value[1:-1].split(',')]
+                                result['parameters'][key] = values
+                            else:
+                                result['parameters'][key] = value
 
             return result
 

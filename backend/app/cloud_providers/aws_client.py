@@ -46,14 +46,29 @@ class AWSClient:
                 instances = []
                 for reservation in response['Reservations']:
                     for instance in reservation['Instances']:
-                        instances.append({
-                            'InstanceId': instance['InstanceId'],
-                            'InstanceType': instance['InstanceType'],
-                            'State': instance['State']['Name'],
-                            'LaunchTime': instance['LaunchTime'].isoformat(),
+                        # Extract instance details with error handling
+                        instance_details = {
+                            'InstanceId': instance.get('InstanceId', 'Unknown'),
+                            'InstanceType': instance.get('InstanceType', 'Unknown'),
+                            'State': instance.get('State', {}).get('Name', 'Unknown'),
                             'Region': region,
-                            'Tags': instance.get('Tags', [])
-                        })
+                            'Tags': instance.get('Tags', []),
+                            'PublicIpAddress': instance.get('PublicIpAddress', 'None'),
+                            'PrivateIpAddress': instance.get('PrivateIpAddress', 'None'),
+                            'VpcId': instance.get('VpcId', 'None'),
+                            'SubnetId': instance.get('SubnetId', 'None')
+                        }
+                        
+                        # Add launch time if available
+                        if 'LaunchTime' in instance:
+                            instance_details['LaunchTime'] = instance['LaunchTime'].isoformat()
+                        
+                        # Add name tag if available
+                        name_tag = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), None)
+                        if name_tag:
+                            instance_details['Name'] = name_tag
+                        
+                        instances.append(instance_details)
                 if instances:  # Only add regions that have instances
                     all_instances[region] = instances
             except ClientError as e:
@@ -62,100 +77,135 @@ class AWSClient:
 
         return all_instances
 
-    def list_s3_buckets(self) -> Dict[str, List[Dict[str, Any]]]:
+    def list_s3_buckets(self) -> Dict[str, Any]:
         """List all S3 buckets with their region information"""
         try:
             s3 = self.session.client('s3')
             response = s3.list_buckets()
             buckets_by_region = {}
+            errors = []
+            inaccessible_buckets = []
+
+            if not response.get('Buckets'):
+                return {
+                    "status": "empty",
+                    "message": "No S3 buckets found in the account",
+                    "data": {}
+                }
 
             for bucket in response['Buckets']:
+                bucket_name = bucket['Name']
                 try:
                     # Get bucket location (region)
-                    location = s3.get_bucket_location(Bucket=bucket['Name'])
+                    location = s3.get_bucket_location(Bucket=bucket_name)
                     region = location['LocationConstraint'] or 'us-east-1'  # None means us-east-1
                     
+                    # Initialize bucket info
+                    bucket_info = {
+                        'Name': bucket_name,
+                        'CreationDate': bucket['CreationDate'].isoformat(),
+                        'Region': region,
+                        'Size': 0,
+                        'ObjectCount': 0,
+                        'Tags': {},
+                        'Versioning': 'Unknown',
+                        'Encryption': 'Unknown',
+                        'AccessStatus': 'Full'
+                    }
+
                     # Get bucket size and object count
-                    size = 0
-                    object_count = 0
                     try:
                         s3_regional = self.session.client('s3', region_name=region)
                         paginator = s3_regional.get_paginator('list_objects_v2')
-                        for page in paginator.paginate(Bucket=bucket['Name']):
+                        for page in paginator.paginate(Bucket=bucket_name):
                             if 'Contents' in page:
                                 for obj in page['Contents']:
-                                    size += obj['Size']
-                                    object_count += 1
-                    except ClientError:
-                        # Skip if we can't access bucket contents
-                        pass
+                                    bucket_info['Size'] += obj['Size']
+                                    bucket_info['ObjectCount'] += 1
+                    except ClientError as e:
+                        bucket_info['AccessStatus'] = 'Limited'
+                        errors.append({
+                            'bucket': bucket_name,
+                            'operation': 'list_objects',
+                            'error': str(e)
+                        })
 
-                    bucket_info = {
-                        'Name': bucket['Name'],
-                        'CreationDate': bucket['CreationDate'].isoformat(),
-                        'Size': size,
-                        'ObjectCount': object_count
-                    }
+                    # Get bucket tags
+                    try:
+                        tags_response = s3.get_bucket_tagging(Bucket=bucket_name)
+                        bucket_info['Tags'] = {tag['Key']: tag['Value'] for tag in tags_response.get('TagSet', [])}
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'NoSuchTagSet':
+                            bucket_info['AccessStatus'] = 'Limited'
+                            errors.append({
+                                'bucket': bucket_name,
+                                'operation': 'get_bucket_tagging',
+                                'error': str(e)
+                            })
+
+                    # Get bucket versioning status
+                    try:
+                        versioning = s3.get_bucket_versioning(Bucket=bucket_name)
+                        bucket_info['Versioning'] = versioning.get('Status', 'Disabled')
+                    except ClientError as e:
+                        bucket_info['AccessStatus'] = 'Limited'
+                        errors.append({
+                            'bucket': bucket_name,
+                            'operation': 'get_bucket_versioning',
+                            'error': str(e)
+                        })
+
+                    # Get bucket encryption
+                    try:
+                        encryption = s3.get_bucket_encryption(Bucket=bucket_name)
+                        bucket_info['Encryption'] = 'Enabled'
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'ServerSideEncryptionConfigurationNotFoundError':
+                            bucket_info['AccessStatus'] = 'Limited'
+                            errors.append({
+                                'bucket': bucket_name,
+                                'operation': 'get_bucket_encryption',
+                                'error': str(e)
+                            })
+                        bucket_info['Encryption'] = 'Disabled'
 
                     if region not in buckets_by_region:
                         buckets_by_region[region] = []
                     buckets_by_region[region].append(bucket_info)
 
-                except ClientError:
-                    # Skip if we can't get bucket location
-                    continue
+                except ClientError as e:
+                    inaccessible_buckets.append({
+                        'bucket': bucket_name,
+                        'error': str(e)
+                    })
 
-            return buckets_by_region
-        except ClientError as e:
-            raise Exception(f'Error listing S3 buckets: {str(e)}')
-
-    def get_cost_and_usage(self, start_date: str, end_date: str) -> Dict[str, Any]:
-        """Get cost and usage data across all regions"""
-        try:
-            ce = self.session.client('ce', region_name='us-east-1')  # Cost Explorer is only available in us-east-1
-            
-            # Get costs grouped by region and service
-            response = ce.get_cost_and_usage(
-                TimePeriod={
-                    'Start': start_date,
-                    'End': end_date
-                },
-                Granularity='MONTHLY',
-                Metrics=['UnblendedCost'],
-                GroupBy=[
-                    {'Type': 'DIMENSION', 'Key': 'REGION'},
-                    {'Type': 'DIMENSION', 'Key': 'SERVICE'}
-                ]
-            )
-
-            # Process and format the response
-            costs_by_region = {}
-            for result in response['ResultsByTime']:
-                for group in result['Groups']:
-                    region = group['Keys'][0]
-                    service = group['Keys'][1]
-                    cost = float(group['Metrics']['UnblendedCost']['Amount'])
-
-                    if region not in costs_by_region:
-                        costs_by_region[region] = {}
-                    
-                    if service not in costs_by_region[region]:
-                        costs_by_region[region][service] = 0
-                    
-                    costs_by_region[region][service] += cost
-
-            return {
-                'period': {
-                    'start': start_date,
-                    'end': end_date
-                },
-                'costs_by_region': costs_by_region,
-                'total_cost': sum(sum(services.values()) for services in costs_by_region.values())
+            result = {
+                "status": "success" if buckets_by_region else "empty",
+                "message": "S3 buckets retrieved successfully" if buckets_by_region else "No accessible S3 buckets found",
+                "data": buckets_by_region
             }
 
-        except ClientError as e:
-            raise Exception(f'Error getting cost and usage data: {str(e)}')
+            if errors:
+                result["warnings"] = {
+                    "message": "Some bucket information could not be fully retrieved",
+                    "errors": errors
+                }
 
+            if inaccessible_buckets:
+                result["inaccessible_buckets"] = {
+                    "message": "Some buckets were completely inaccessible",
+                    "buckets": inaccessible_buckets
+                }
+
+            return result
+
+        except ClientError as e:
+            return {
+                "status": "error",
+                "message": f"Error listing S3 buckets: {str(e)}",
+                "error": str(e),
+                "data": {}
+            }
 
     def get_cost_and_usage(self, start_date: str, end_date: str) -> Dict[str, Any]:
         """Get AWS cost and usage data for a specific time period"""
